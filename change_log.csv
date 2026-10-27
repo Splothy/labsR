@@ -1,0 +1,14 @@
+field,rule,n_changed,example
+*,drop full duplicates,524,
+scheduled_arrival,parse DD.MM.YYYY/ISO; normalize to Kyiv,7258,2024-04-06 15:57:00+03:00
+scheduled_departure,parse DD.MM.YYYY/ISO; normalize to Kyiv,7250,2024-04-06 15:57:30+03:00
+actual_arrival,parse DD.MM.YYYY/ISO; normalize to Kyiv,6598,2024-04-06 15:58:59+03:00
+actual_departure,parse DD.MM.YYYY/ISO; normalize to Kyiv,6339,2024-04-06 15:59:55+03:00
+stop_name,trim/synonyms/title + mode per stop_id,23397,'Zelena Sq' → 'Zelena Square'
+*,"near-duplicates by trip+stop+scheduled_arrival, keep most complete",525,
+lat/lon,swap if |lat|<|lon|,1005,
+lat/lon,far (>20km) → NaN → median by stop_id,3572,
+boarding_est,"text→number; neg→NA; clip [0,60]",3736,
+alighting_est,"text→number; neg→NA; clip [0,60]",536,
+note,remove invisible chars,7211,
+delay_*,"compute delays; invalid_timing outside [-15,60]",596,
