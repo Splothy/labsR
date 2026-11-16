@@ -1,0 +1,6 @@
+.build/
+.venv/
+.ipynb_checkpoints/
+**/.quarto/
+**/presentation_files/
+__pycache__/
