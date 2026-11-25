@@ -1,0 +1,222 @@
+---
+title: "Лабораторна №3. Прогноз енергоспоживання"
+author: "Ковальчук Ярослав, АтаВДвR-11"
+lang: uk
+format:
+  html:
+    embed-resources: true
+    toc: true
+    html-math-method: mathml
+execute:
+  warning: false
+  message: false
+---
+
+## Вступ
+
+Головне питання: наскільки точно лінійна регресія прогнозує енергію побутових приладів у наступному десятихвилинному інтервалі цього самого будинку порівняно з константним прогнозом?
+
+Продовжено лабораторну №2: Appliances Energy Prediction, Luis Candanedo (2017), [UCI, DOI 10.24432/C5VC8G](https://doi.org/10.24432/C5VC8G), CC BY 4.0. Оригінальний CSV з [репозиторію автора](https://github.com/LuisM78/Appliances-energy-prediction-data) отримано 16.11.2026. Одиниця спостереження — десятихвилинний інтервал одного будинку в Бельгії; ціль `Appliances`, Wh. Прогноз стосується пізніших дат цього будинку, а не інших домогосподарств.
+
+### Предметна література та гіпотези
+
+[Candanedo, Feldheim і Deramaix (2017)](https://doi.org/10.1016/j.enbuild.2017.01.083) досліджують прогнозування енергії приладів за сенсорними й погодними даними. Це обґрунтовує вибір температури, вологості й освітлення як кандидатів, але не гарантує переносимості їхніх результатів на інший протокол перевірки.
+
+[Richardson, Thomson, Infield і Clifford (2010)](https://doi.org/10.1016/j.enbuild.2010.05.023) моделюють побутовий попит через активну присутність мешканців і добові профілі діяльності. Тому додаємо циклічний час доби та тип дня. На відміну від першого джерела, ця праця прямо акцентує поведінку людей. У наших даних присутність не вимірюється, тому календар та освітлення є лише непрямими характеристиками активності.
+
+До оцінювання фіксуємо дві **розвідувальні** гіпотези, підказані попереднім EDA:
+
+1. За врахування температури кухні, вологості та календаря попереднє споживання освітлення позитивно пов’язане з наступним споживанням приладів. Перевірка: величина коефіцієнта `lights` та наближений 95% HAC-інтервал базової регресії.
+2. Прогнозований рівень о 18:00 вищий, ніж о 03:00, за однакових інших ознак. Перевірка: лінійний контраст синусного й косинусного коефіцієнтів із HAC-інтервалом.
+
+Ці гіпотези не є незалежним підтверджувальним дослідженням: лабораторна №2 вже охопила весь набір. Тестовий період також раніше переглядався в EDA. Нових даних немає, тому фінальна оцінка є хронологічно відкладеною, але не повністю незалежною.
+
+## Методи
+
+```{r}
+if (.Platform$OS.type == "windows") invisible(Sys.setlocale("LC_ALL", "English_United States.utf8"))
+library(ggplot2)
+library(sandwich)
+dir.create("outputs/tables", recursive=TRUE, showWarnings=FALSE)
+dir.create("outputs/figures", recursive=TRUE, showWarnings=FALSE)
+dir.create("outputs/models", recursive=TRUE, showWarnings=FALSE)
+tab <- function(x, name) {write.csv(x,paste0("outputs/tables/",name,".csv"),row.names=FALSE,fileEncoding="UTF-8"); knitr::kable(x,digits=3)}
+theme_set(theme_minimal(base_size=15,base_family="Unbounded") +
+  theme(panel.grid.minor=element_blank(),panel.grid.major.x=element_blank(),legend.position="top"))
+if (!"Unbounded" %in% systemfonts::system_fonts()$family)
+  systemfonts::register_font("Unbounded",plain="reports/Unbounded-Regular.ttf",bold="reports/Unbounded-Bold.ttf")
+fig <- function(p,name,w=11,h=4) {
+  p <- p + guides(fill=guide_colourbar(barwidth=grid::unit(6,"cm"),barheight=grid::unit(.3,"cm"),title.position="top"))
+  ggsave(paste0("outputs/figures/",name,".svg"),p,device=svglite::svglite,width=w,height=h,bg="white")
+  file <- paste0("outputs/figures/",name,".svg")
+  css <- paste0("<style>@font-face{font-family:Unbounded;font-weight:400;src:url(data:font/ttf;base64,",
+    base64enc::base64encode("reports/Unbounded-Regular.ttf"),")}@font-face{font-family:Unbounded;font-weight:700;src:url(data:font/ttf;base64,",
+    base64enc::base64encode("reports/Unbounded-Bold.ttf"),")}</style>")
+  svg <- paste(readLines(file,warn=FALSE,encoding="UTF-8"),collapse="\n")
+  writeLines(sub("<defs>",paste0("<defs>",css),svg,fixed=TRUE),file,useBytes=TRUE)
+  knitr::include_graphics(file)
+}
+raw <- read.csv("data/raw/energydata_complete.csv")
+clock <- as.POSIXct(raw$date,tz="UTC")
+stopifnot(nrow(raw)==19735,!anyNA(raw),!anyDuplicated(clock),all(as.numeric(diff(clock),units="secs")==600))
+# UTC is a neutral parsing scale; the source does not document a time zone.
+n <- nrow(raw)
+d <- data.frame(time=clock[2:n], y=raw$Appliances[2:n],
+  lights=raw$lights[1:(n-1)], T1=raw$T1[1:(n-1)], RH_1=raw$RH_1[1:(n-1)])
+h <- as.numeric(format(d$time,"%H")) + as.numeric(format(d$time,"%M"))/60
+d$sin_h <- sin(2*pi*h/24); d$cos_h <- cos(2*pi*h/24)
+d$sin2 <- sin(4*pi*h/24); d$cos2 <- cos(4*pi*h/24)
+d$weekend <- as.integer(as.POSIXlt(d$time)$wday %in% c(0,6))
+dates <- sort(unique(as.Date(d$time)))
+cut_date <- dates[floor(.8*length(dates))+1]
+train <- d[as.Date(d$time)<cut_date,]
+# No target values from the held-out period are used below until final evaluation.
+split <- data.frame(part=c("Навчання","Тест"),
+  start=c(as.character(min(train$time)),as.character(min(d$time[as.Date(d$time)>=cut_date]))),
+  end=c(as.character(max(train$time)),as.character(max(d$time))),
+  n=c(nrow(train),sum(as.Date(d$time)>=cut_date)))
+tab(split,"split")
+```
+
+Після зсуву маємо `r nrow(d)` пар. Вхідні ознаки — попередні завершені вимірювання кухні та освітлення, а час наступного інтервалу відомий наперед. Поточна ціль і майбутні сенсорні значення не входять до предикторів. Інтерпольовані дані метеостанції не використовуємо через невизначеність їхньої доступності в реальному часі. Протокол припускає, що попередній завершений запис уже доступний без затримки.
+
+Пропусків і дублікатів немає. Піки збережено. У №2 виявлено правий хвіст, вечірнє зростання та часову залежність; нижче рішення уточнюються тільки на навчальних даних. UTC слугує технічною шкалою без переведення надрукованого часу. Змістовний часовий пояс джерела невідомий.
+
+```{r}
+fig(ggplot(train,aes(y))+geom_histogram(binwidth=20,fill="#1B4F8A",colour="white")+
+  labs(x="Енергія за 10 хв, Wh",y="Інтервалів"),"distribution")
+profile <- aggregate(y~hour,data=data.frame(y=train$y,hour=as.integer(format(train$time,"%H"))),mean)
+fig(ggplot(profile,aes(hour,y))+geom_line(colour="#1B4F8A",linewidth=1.3)+geom_point(size=3,colour="#1B4F8A")+
+  labs(x="Година доби",y="Середня енергія, Wh"),"profile")
+fig(ggplot(train,aes(lights,y))+geom_bin_2d(bins=30)+scale_fill_gradient(low="#EEF3F8",high="#1B4F8A")+
+  labs(x="Попереднє освітлення, Wh",y="Наступна енергія приладів, Wh",fill="Інтервалів"),"association")
+```
+
+Асиметрія обґрунтовує увагу до пікових помилок. Основна метрика — **RMSE**, оскільки вона сильніше штрафує великі промахи; додатково подаємо MAE. Обидві вимірюються у Wh. Добовий профіль обґрунтовує циклічні ознаки, а широкий розкид при однаковому освітленні обмежує точність простого зв’язку.
+
+### Зафіксовані моделі та перевірка
+
+Константа — середнє навчальної частини. Базова регресія використовує попередні `lights`, `T1`, `RH_1`, першу добову гармоніку та тип дня. Модифікація додає другу гармоніку та взаємодії першої гармоніки з вихідним днем, щоб дозволити складніший добовий профіль. Інші моделі не підбираємо. Імпутація, масштабування та автоматичний відбір ознак не потрібні.
+
+```{r}
+forms <- list(base=y~lights+T1+RH_1+sin_h+cos_h+weekend,
+  modified=y~lights+T1+RH_1+sin_h+cos_h+weekend+sin2+cos2+sin_h:weekend+cos_h:weekend)
+forms
+metric <- function(y,p) c(RMSE=sqrt(mean((y-p)^2)),MAE=mean(abs(y-p)))
+td <- sort(unique(as.Date(train$time)))
+folds <- list(); cv <- data.frame()
+for (i in 1:4) {
+  a <- floor(length(td)*(.4+.1*(i-1))); b <- floor(length(td)*(.5+.1*(i-1)))
+  tr <- train[as.Date(train$time)<=td[a],]; va <- train[as.Date(train$time)>td[a]&as.Date(train$time)<=td[b],]
+  folds[[i]] <- data.frame(fold=i,train_end=as.character(max(tr$time)),
+    validation_start=as.character(min(va$time)),validation_end=as.character(max(va$time)),n_train=nrow(tr),n_validation=nrow(va))
+  for (name in c("constant",names(forms))) {
+    p <- if(name=="constant") rep(mean(tr$y),nrow(va)) else predict(lm(forms[[name]],data=tr),newdata=va)
+    m <- metric(va$y,p)
+    cv <- rbind(cv,data.frame(fold=i,model=name,RMSE=m[1],MAE=m[2],row.names=NULL))
+  }
+}
+tab(do.call(rbind,folds),"folds")
+tab(cv,"cv_folds")
+cv_summary <- do.call(rbind,lapply(split(cv,cv$model),function(x)
+  data.frame(model=x$model[1],RMSE_mean=mean(x$RMSE),RMSE_sd=sd(x$RMSE),MAE_mean=mean(x$MAE),MAE_sd=sd(x$MAE))))
+rownames(cv_summary)<-NULL
+tab(cv_summary,"cv_summary")
+selected <- cv_summary$model[which.min(replace(cv_summary$RMSE_mean,cv_summary$model=="constant",Inf))]
+saveRDS(list(model=selected,formulas=forms,primary_metric="RMSE",test_start=cut_date),"outputs/models/selection.rds")
+```
+
+Чотири розбиття мають зростаюче навчальне вікно та наступний неперекривний блок валідації. Усі моделі оцінено на тих самих блоках. Параметри кожної моделі й константу обчислюємо тільки на відповідній минулій частині. За середнім RMSE до відкриття тесту обрано **`r selected`**. Базова модель має середній RMSE 95,29 Wh, модифікована — 95,48 Wh. Додаткові гармоніки та взаємодії не дали переваги, тому залишаємо базову модель. Розкид між блоками показує нестабільність якості в різних періодах, а не довірчий інтервал метрики.
+
+## Результати
+
+### Коефіцієнти та гіпотези
+
+```{r}
+base <- lm(forms$base,data=train)
+V <- NeweyWest(base,lag=144,prewhite=FALSE,adjust=TRUE)
+beta <- coef(base); se <- sqrt(diag(V))
+coefficients <- data.frame(term=names(beta),estimate=beta,lower=beta-1.96*se,upper=beta+1.96*se)
+tab(coefficients,"coefficients_hac")
+contrast <- rep(0,length(beta));names(contrast)<-names(beta)
+contrast["sin_h"] <- sin(2*pi*18/24)-sin(2*pi*3/24)
+contrast["cos_h"] <- cos(2*pi*18/24)-cos(2*pi*3/24)
+effect <- sum(contrast*beta); uncertainty <- sqrt(drop(t(contrast)%*%V%*%contrast))
+hypotheses <- data.frame(hypothesis=c("H1: lights +1 Wh","H2: 18:00 проти 03:00"),
+  estimate=c(beta["lights"],effect),lower=c(beta["lights"]-1.96*se["lights"],effect-1.96*uncertainty),
+  upper=c(beta["lights"]+1.96*se["lights"],effect+1.96*uncertainty))
+tab(hypotheses,"hypotheses")
+```
+
+Коефіцієнт освітлення означає зміну наступної енергії приладів у Wh при збільшенні попереднього освітлення на 1 Wh за однакових інших предикторів. Для температури одиниця зміни — 1 °C, для вологості — один відсотковий пункт. Синус і косинус інтерпретуємо спільно через часовий контраст, а не окремо як годинні ефекти.
+
+Для H1 оцінка становить `r round(hypotheses$estimate[1],2)` Wh, 95% інтервал [`r round(hypotheses$lower[1],2)`; `r round(hypotheses$upper[1],2)`]. Для H2 різниця становить `r round(effect,2)` Wh, інтервал [`r round(hypotheses$lower[2],2)`; `r round(hypotheses$upper[2],2)`]. Додатний інтервал узгоджується з очікуваним напрямом; включення нуля означає невизначеність напряму за цим методом. Обидва інтервали додатні й не включають нуль: результати узгоджуються з H1 та H2, зберігаючи їхній розвідувальний статус. Обидві оцінки є асоціаціями.
+
+Інтервали наближені, Newey–West із лагом 144 інтервали (одна доба) та нормальною апроксимацією. Вони враховують гетероскедастичність і коротку часову залежність, але не усувають сезонність, специфікаційну помилку й обмеження вибраного лага.
+
+### Діагностика базової регресії
+
+```{r}
+diag <- data.frame(fitted=fitted(base),residual=residuals(base),cook=cooks.distance(base),leverage=hatvalues(base))
+fig(ggplot(diag,aes(fitted,residual))+geom_bin_2d(bins=40)+
+  geom_hline(yintercept=0,colour="#C46B36")+scale_fill_gradient(low="#EEF3F8",high="#1B4F8A")+
+  labs(x="Прогноз, Wh",y="Залишок, Wh",fill="Інтервалів"),"residuals")
+qq <- data.frame(sample=sort(diag$residual),theoretical=qnorm(ppoints(nrow(diag))))
+fig(ggplot(qq,aes(theoretical,sample))+geom_point(size=.6,alpha=.3,colour="#1B4F8A")+
+  labs(x="Теоретичні нормальні квантилі",y="Квантилі залишків, Wh"),"qq")
+diagnostics <- data.frame(lag1=acf(diag$residual,plot=FALSE,lag.max=1)$acf[2],
+  cook_over_4n=sum(diag$cook>4/nrow(train)),high_leverage=sum(diag$leverage>2*length(beta)/nrow(train)))
+tab(diagnostics,"diagnostics")
+fig(ggplot(data.frame(index=seq_len(nrow(diag)),cook=diag$cook),aes(index,cook))+
+  geom_point(size=.5,colour="#1B4F8A")+geom_hline(yintercept=4/nrow(train),colour="#C46B36")+
+  labs(x="Порядок навчального запису",y="Відстань Кука"),"influence")
+```
+
+Графік залишків показує великі позитивні промахи й неоднаковий розкид: модель недооцінює частину високого споживання. Перевірка нелінійного добового профілю через модифікацію не покращила валідацію. Відхилення хвостів на Q–Q графіку обмежує нормальне припущення. Автокореляція першого лага дорівнює `r round(diagnostics$lag1,3)`. За правилом Кука 4/n позначено `r diagnostics$cook_over_4n` записів: це діагностичний поріг, а не підстава видалити їх. Такі порушення вимагають обережних висновків про коефіцієнти та перевірки прогнозу на майбутніх блоках. Модифікація адресує добову форму, але не гарантує усунення всіх порушень.
+
+### Одноразова фінальна оцінка
+
+```{r}
+# Selection was saved above. Only now open the held-out outcomes.
+test <- d[as.Date(d$time)>=cut_date,]
+final <- lm(forms[[selected]],data=train)
+prediction <- predict(final,newdata=test)
+constant <- rep(mean(train$y),nrow(test))
+test_scores <- rbind(data.frame(model="constant",t(metric(test$y,constant))),
+  data.frame(model=selected,t(metric(test$y,prediction))))
+tab(test_scores,"test_scores")
+predictions <- data.frame(time=test$time,actual=test$y,predicted=prediction,constant=constant,error=test$y-prediction)
+write.csv(predictions,"outputs/tables/test_predictions.csv",row.names=FALSE)
+saveRDS(final,"outputs/models/final_model.rds")
+fig(ggplot(predictions,aes(actual,predicted))+geom_bin_2d(bins=35)+
+  geom_abline(slope=1,intercept=0,colour="#C46B36")+scale_fill_gradient(low="#EEF3F8",high="#1B4F8A")+
+  labs(x="Фактична енергія, Wh",y="Прогноз, Wh",fill="Інтервалів"),"actual_predicted")
+threshold <- quantile(train$y,.9)
+predictions$group <- ifelse(predictions$actual>threshold,"Вище навчального P90","Інші")
+errors <- do.call(rbind,lapply(split(predictions,predictions$group),function(x)
+ data.frame(group=x$group[1],n=nrow(x),RMSE=sqrt(mean(x$error^2)),MAE=mean(abs(x$error)))))
+tab(errors,"error_groups")
+comparison <- cv_summary
+fig(ggplot(comparison,aes(model,RMSE_mean))+geom_col(fill="#1B4F8A",width=.55)+
+ geom_errorbar(aes(ymin=pmax(0,RMSE_mean-RMSE_sd),ymax=RMSE_mean+RMSE_sd),width=.15)+
+ scale_x_discrete(labels=c(base="Базова",constant="Константа",modified="Модифікована"))+
+ labs(x=NULL,y="RMSE валідації, Wh"),"cv")
+capture.output(sessionInfo(),file="outputs/sessionInfo.txt")
+```
+
+## Обговорення та висновки
+
+На відкладеному періоді обрана модель має RMSE **`r round(test_scores$RMSE[2],2)` Wh** і MAE **`r round(test_scores$MAE[2],2)` Wh**. Константа має RMSE **`r round(test_scores$RMSE[1],2)` Wh**. Зміна RMSE щодо константи становить **`r round(100*(1-test_scores$RMSE[2]/test_scores$RMSE[1]),1)`%**: додатне значення означає покращення, від’ємне — погіршення. Вибір моделі після цієї оцінки не змінюємо.
+
+Отже, відповідь на головне питання визначає саме порівняння з константою: сенсорні й календарні ознаки дають вимірювану, але обмежену точність наступного інтервалу. Таблиця помилок окремо показує якість на піках; межа піка визначена навчальним P90. Недооцінювання великих значень на графіку означає, що середній профіль не відтворює раптові ввімкнення приладів. Від’ємні прогнози, якщо вони виникають, також показують обмеження звичайної лінійної регресії; після тесту їх не обрізаємо.
+
+Обидві гіпотези оцінено за знаком, величиною та невизначеністю в таблиці вище. Їхній розвідувальний статус збережено. Поведінка мешканців може змішувати зв’язки освітлення, часу й енергії. Дані одного будинку за січень–травень не дозволяють узагальнювати результат на інші будинки чи сезони. Наступний конкретний крок — отримати наступний місяць вимірювань цього будинку та перевірити незмінену модель на ньому, із журналом фактичної доступності сенсорів.
+
+## Джерела
+
+1. Candanedo, L. (2017). Appliances Energy Prediction. UCI. DOI: [10.24432/C5VC8G](https://doi.org/10.24432/C5VC8G). CC BY 4.0.
+2. Candanedo, L. M., Feldheim, V., Deramaix, D. (2017). *Data driven prediction models of energy use of appliances in a low-energy house*. Energy and Buildings, 140, 81–97. DOI: [10.1016/j.enbuild.2017.01.083](https://doi.org/10.1016/j.enbuild.2017.01.083).
+3. Richardson, I., Thomson, M., Infield, D., Clifford, C. (2010). *Domestic electricity use: A high-resolution energy demand model*. Energy and Buildings, 42(10), 1878–1887. DOI: [10.1016/j.enbuild.2010.05.023](https://doi.org/10.1016/j.enbuild.2010.05.023).
+4. [sandwich: Newey–West covariance estimator](https://sandwich.r-forge.r-project.org/reference/NeweyWest.html).
+5. [NIST: Regression model diagnostics](https://www.itl.nist.gov/div898/handbook/pmd/section4/pmd44.htm).
+6. [Умова лабораторної №3](https://kleban.notion.site/da-lab-3).
